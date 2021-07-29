@@ -14,6 +14,8 @@ import logging
 import os
 import horovod.tensorflow.keras as hvd
 import transformers as ppb
+import numpy as np
+from official.nlp import optimization
 
 hvd.init()
 
@@ -22,13 +24,11 @@ DATASET_TENSORSPEC = ({'input_ids': TensorSpec(shape=(512,), dtype=tf.int32, nam
                        'attention_mask': TensorSpec(shape=(512,), dtype=tf.int32, name=None)},
                       TensorSpec(shape=(), dtype=tf.float64, name=None))
 
-
 gpus = tf.config.experimental.list_physical_devices('GPU')
 for gpu in gpus:
     tf.config.experimental.set_memory_growth(gpu, True)
 if gpus:
     tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')
-
 
 logger = logging.getLogger(__name__)
 
@@ -42,54 +42,104 @@ class SavePretrainedCallback(tf.keras.callbacks.Callback):
         self.output_dir = output_dir
 
     def on_epoch_end(self, epoch, logs=None):
-        self.model.save_pretrained(self.output_dir.format(epoch=epoch))
+        self.model.save_weights(self.output_dir.format(epoch=epoch))
 
 
 model_class, tokenizer_class, pretrained_weights = (
-    ppb.TFBertForSequenceClassification, ppb.BertTokenizerFast,
-    'bert-base-uncased')  # for trainer API
+    ppb.TFDistilBertModel, ppb.BertTokenizerFast, 'distilbert-base-uncased')  # for trainer API
 
-config = ppb.BertConfig.from_pretrained(pretrained_weights, num_labels=1, problem_type="regression")
+config = ppb.DistilBertConfig(output_hidden_states=True, num_labels=1)
 tokenizer = tokenizer_class.from_pretrained(pretrained_weights, config=config)
 model = model_class.from_pretrained(pretrained_weights, config=config)
 
-train_dataset = tf.data.experimental.load(f"./dataset_shards/train_dataset_{hvd.rank()}", element_spec=DATASET_TENSORSPEC, compression="GZIP")
-val_dataset = tf.data.experimental.load(f"./dataset_shards/val_dataset_{hvd.rank()}", element_spec=DATASET_TENSORSPEC, compression="GZIP")
+weight_initializer = tf.keras.initializers.GlorotNormal()
+input_ids_layer = tf.keras.layers.Input(shape=(512,),
+                                        name='input_ids',
+                                        dtype='int32')
+input_attention_layer = tf.keras.layers.Input(shape=(512,),
+                                              name='attention_mask',
+                                              dtype='int32')
+last_hidden_state = model([input_ids_layer, input_attention_layer])[0]
+
+cls_token = last_hidden_state[:, 0, :]
+
+leaky_relu = tf.keras.layers.LeakyReLU(alpha=0.01)
+output = tf.keras.layers.Dense(config.dim,
+                               kernel_initializer=weight_initializer,
+                               activation=leaky_relu)(cls_token)
+output = tf.keras.layers.Dropout(0.40)(output)
+output = tf.keras.layers.Dense(config.num_labels,
+                               kernel_initializer=weight_initializer,
+                               kernel_constraint=None,
+                               bias_initializer='zeros')(output)
+full_model = tf.keras.Model([input_ids_layer, input_attention_layer], output)
+
+train_dataset = tf.data.experimental.load(f"./dataset_shards/train_dataset_{hvd.rank()}",
+                                          element_spec=DATASET_TENSORSPEC, compression="GZIP").take(1000)
+val_dataset = tf.data.experimental.load(f"./dataset_shards/val_dataset_{hvd.rank()}", element_spec=DATASET_TENSORSPEC,
+                                        compression="GZIP").take(100)
+
+keys_tensor = tf.constant(['0.00', '0.25', '0.50', '0.75', '1.00'])
+values_tensor = tf.constant(
+    [0.25516214033513884,
+     0.3653295143642076,
+     0.2432143530403531,
+     0.10369791403102925,
+     0.03259607822927125])
+table = tf.lookup.StaticHashTable(
+    tf.lookup.KeyValueTensorInitializer(
+        keys_tensor,
+        values_tensor,
+        key_dtype=tf.string,
+        value_dtype=tf.float32
+    ),
+    0
+)
+
+
+def map(input, label):
+    weight = table.lookup(tf.strings.as_string(label, precision=2))
+    return input, label, weight
+
+
+train_dataset = train_dataset.map(map, num_parallel_calls=tf.data.AUTOTUNE)
 if hvd.rank() == 0:
-    test_dataset = tf.data.experimental.load("./dataset_shards/test_dataset_0", element_spec=DATASET_TENSORSPEC, compression="GZIP")
+    test_dataset = tf.data.experimental.load("./dataset_shards/test_dataset_0", element_spec=DATASET_TENSORSPEC,
+                                             compression="GZIP")
     for i in range(1, 8):
-        in_data = tf.data.experimental.load(f"./dataset_shards/test_dataset_{i}", element_spec=DATASET_TENSORSPEC, compression="GZIP")
+        in_data = tf.data.experimental.load(f"./dataset_shards/test_dataset_{i}", element_spec=DATASET_TENSORSPEC,
+                                            compression="GZIP")
         test_dataset = test_dataset.concatenate(in_data)
+    test_dataset = test_dataset.take(100)
 
 
 optimizer = tf.keras.optimizers.Adam(learning_rate=5e-5 * hvd.size())
 optimizer = hvd.DistributedOptimizer(optimizer)
 
 loss_fn = tf.keras.losses.MeanSquaredError()
-metrics = ['RootMeanSquaredError']
+metrics = []
 
-model.compile(optimizer=optimizer,
-              loss=loss_fn,
-              metrics=metrics,
-              experimental_run_tf_function=False)
+full_model.compile(optimizer=optimizer,
+                   loss=loss_fn,
+                   metrics=metrics,
+                   experimental_run_tf_function=False)
 
-BATCH_SIZE = 8
-N_EPOCHS = 3
 OUTPUT_DIR = "./output"
 
 callbacks = [hvd.callbacks.BroadcastGlobalVariablesCallback(0)]
 
 if hvd.rank() == 0:
-    callbacks.append(SavePretrainedCallback(output_dir="./checkpoints/checkpoint-{epoch}.h5"))
-num_train_samples = 309624
+    callbacks.append(SavePretrainedCallback(output_dir="./checkpoints/checkpoint-test-{epoch}"))
 
-model.fit(train_dataset.batch(BATCH_SIZE),
-          validation_data=val_dataset.batch(BATCH_SIZE),
-          epochs=N_EPOCHS,
-          batch_size=BATCH_SIZE,
-          callbacks=callbacks,
-          verbose=1 if hvd.rank() == 0 else 0,
-          steps_per_epoch=num_train_samples // BATCH_SIZE)
+num_val_samples = tf.data.experimental.cardinality(val_dataset).numpy()
+
+full_model.fit(train_dataset.shuffle(10000).repeat().batch(BATCH_SIZE),
+               validation_data=val_dataset.shuffle(10000).repeat().batch(BATCH_SIZE),
+               epochs=N_EPOCHS,
+               callbacks=callbacks,
+               verbose=1 if hvd.rank() == 0 else 0,
+               steps_per_epoch=num_train_samples // BATCH_SIZE,
+               validation_steps=num_val_samples // BATCH_SIZE)
 
 if hvd.rank() == 0:
     logger.info("Predictions on test dataset...")

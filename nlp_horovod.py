@@ -150,10 +150,12 @@ full_model.fit(train_dataset.shuffle(10000).repeat().batch(BATCH_SIZE),
 
 if hvd.rank() == 0:
     logger.info("Predictions on test dataset...")
-    predictions = model.predict(test_dataset.batch(batch_size=BATCH_SIZE))
-    out_test_file = os.path.join(OUTPUT_DIR, "test_results.txt")
+    num_test_steps = tf.data.experimental.cardinality(test_dataset).numpy() // BATCH_SIZE
+    predictions = full_model.predict(test_dataset.batch(BATCH_SIZE), steps=num_test_steps, verbose=1)
+    predicted_class = np.squeeze(predictions)
+    out_test_file = os.path.join(OUTPUT_DIR, "test_results2.txt")
     with open(out_test_file, "w") as writer:
-        writer.write(str(predictions.to_tuple()))
+        writer.write(str(predicted_class.tolist()))
         for ele in test_dataset.enumerate().as_numpy_iterator():
             writer.write(str(ele))
         logger.info(f"Wrote predictions to {out_test_file}")

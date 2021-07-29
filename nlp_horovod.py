@@ -112,8 +112,15 @@ if hvd.rank() == 0:
         test_dataset = test_dataset.concatenate(in_data)
     test_dataset = test_dataset.take(100)
 
-
-optimizer = tf.keras.optimizers.Adam(learning_rate=5e-5 * hvd.size())
+BATCH_SIZE = 16
+N_EPOCHS = 3
+num_train_samples = tf.data.experimental.cardinality(train_dataset).numpy()
+num_train_steps = N_EPOCHS*(num_train_samples//BATCH_SIZE)
+num_warmup_steps = int(0.1*num_train_steps)
+optimizer = optimization.create_optimizer(init_lr=2e-5 * hvd.size(),
+                                          num_train_steps=num_train_steps,
+                                          num_warmup_steps=num_warmup_steps,
+                                          optimizer_type='adamw')
 optimizer = hvd.DistributedOptimizer(optimizer)
 
 loss_fn = tf.keras.losses.MeanSquaredError()

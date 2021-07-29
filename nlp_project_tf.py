@@ -21,6 +21,7 @@ from collections import Counter
 
 logger = logging.getLogger(__name__)
 
+
 class SavePretrainedCallback(tf.keras.callbacks.Callback):
     # Hugging Face models have a save_pretrained() method that saves both the weights and the necessary
     # metadata to allow them to be loaded as a pretrained model in future. This is a simple Keras callback
@@ -30,7 +31,7 @@ class SavePretrainedCallback(tf.keras.callbacks.Callback):
         self.output_dir = output_dir
 
     def on_epoch_end(self, epoch, logs=None):
-        self.model.save_pretrained(self.output_dir)
+        self.model.save_weights(self.output_dir)
 
 
 """#Dataset Preprocessing 
@@ -39,57 +40,102 @@ Read first 4000 rows from amazon dataset
 
 """
 
-#df = pd.read_csv('books_v1_02_cleaned.tsv.gz', compression='gzip', sep='\t')
-df = pd.read_csv('out.csv', nrows=20)
+# df = pd.read_csv('books_v1_02_cleaned.tsv.gz', compression='gzip', sep='\t')
+df = pd.read_csv('out.csv', nrows=40)
 
-df = df.astype({'star_rating': float})
-df['star_rating'] = (df['star_rating'] - 1) / 4.
+df = df.astype({'star_rating': int})
+df['star_rating'] = (df['star_rating'] - 1) / 4.0
 
 train_texts, val_texts, train_labels, val_labels = train_test_split(df.review_body.values, df.star_rating.values,
                                                                     test_size=.2)
 test_texts, val_texts, test_labels, val_labels = train_test_split(val_texts, val_labels, test_size=.5)
 
 model_class, tokenizer_class, pretrained_weights = (
-    ppb.TFDistilBertForSequenceClassification, ppb.DistilBertTokenizerFast, 'distilbert-base-uncased')  # for trainer API
+    ppb.TFDistilBertModel, ppb.BertTokenizerFast, 'distilbert-base-uncased')  # for trainer API
 
-config = ppb.DistilBertConfig.from_pretrained(pretrained_weights, num_labels=1, problem_type="regression")
+config = ppb.DistilBertConfig(output_hidden_states=True, num_labels=1)
 tokenizer = tokenizer_class.from_pretrained(pretrained_weights, config=config)
 model = model_class.from_pretrained(pretrained_weights, config=config)
 
-train_encodings = tokenizer(train_texts.tolist(), padding=True, truncation=True)
-val_encodings = tokenizer(val_texts.tolist(), padding=True, truncation=True)
-test_encodings = tokenizer(test_texts.tolist(), padding=True, truncation=True)
+weight_initializer = tf.keras.initializers.GlorotNormal()
+input_ids_layer = tf.keras.layers.Input(shape=(512,),
+                                        name='input_ids',
+                                        dtype='int32')
+input_attention_layer = tf.keras.layers.Input(shape=(512,),
+                                              name='attention_mask',
+                                              dtype='int32')
+last_hidden_state = model([input_ids_layer, input_attention_layer])[0]
+
+cls_token = last_hidden_state[:, 0, :]
+
+output = tf.keras.layers.Dense(config.dim,
+                               kernel_initializer=weight_initializer,
+                               activation='relu')(cls_token)
+output = tf.keras.layers.Dropout(0.15)(output)
+output = tf.keras.layers.Dense(config.num_labels,
+                               kernel_initializer=weight_initializer,
+                               kernel_constraint=None,
+                               bias_initializer='zeros')(output)
+full_model = tf.keras.Model([input_ids_layer, input_attention_layer], output)
+
+train_encodings = tokenizer(train_texts.tolist(), padding='max_length', truncation=True, max_length=512)
+val_encodings = tokenizer(val_texts.tolist(), padding='max_length', truncation=True, max_length=512)
+test_encodings = tokenizer(test_texts.tolist(), padding='max_length', truncation=True, max_length=512)
 
 train_dataset = tf.data.Dataset.from_tensor_slices((dict(train_encodings), list(train_labels)))
 val_dataset = tf.data.Dataset.from_tensor_slices((dict(val_encodings), list(val_labels)))
 test_dataset = tf.data.Dataset.from_tensor_slices((dict(test_encodings), list(test_labels)))
 
-print(train_dataset.element_spec)
+keys_tensor = tf.constant(['0.00', '0.25', '0.50', '0.750', '1.00'])
+values_tensor = tf.constant(
+    [0.25516214033513884,
+     0.3653295143642076,
+     0.2432143530403531,
+     0.10369791403102925,
+     0.03259607822927125])
+table = tf.lookup.StaticHashTable(
+    tf.lookup.KeyValueTensorInitializer(
+        keys_tensor,
+        values_tensor,
+        key_dtype=tf.string,
+        value_dtype=tf.float32
+    ),
+    0
+)
+
+
+def weight_map(input, label):
+    weight = table.lookup(tf.strings.as_string(label, precision=2))
+    return input, label, weight
+
+
+train_dataset = train_dataset.map(weight_map, num_parallel_calls=tf.data.AUTOTUNE)
+for elem in train_dataset.as_numpy_iterator():
+    print(elem)
 
 optimizer = tf.keras.optimizers.Adam(learning_rate=5e-5)
 loss_fn = tf.keras.losses.MeanSquaredError()
 metrics = ['RootMeanSquaredError']
 
-model.compile(optimizer=optimizer,
-              loss=loss_fn,
-              metrics=metrics)
-
+full_model.compile(optimizer=optimizer,
+                   loss=loss_fn,
+                   metrics=metrics)
 BATCH_SIZE = 32
 N_EPOCHS = 3
 OUTPUT_DIR = "./output"
 
 callbacks = [SavePretrainedCallback(output_dir=OUTPUT_DIR)]
-model.fit(train_dataset.shuffle(len(train_texts)).batch(BATCH_SIZE),
-          validation_data=val_dataset.batch(BATCH_SIZE),
-          epochs=N_EPOCHS,
-          batch_size=BATCH_SIZE,
-          callbacks=callbacks)
+full_model.fit(train_dataset.shuffle(len(train_texts)).batch(BATCH_SIZE),
+               validation_data=val_dataset.batch(BATCH_SIZE),
+               epochs=N_EPOCHS,
+               callbacks=callbacks)
 
 logger.info("Predictions on test dataset...")
-predictions = model.predict(test_dataset.batch(BATCH_SIZE))
+predictions = full_model.predict(test_dataset.batch(BATCH_SIZE))
 out_test_file = os.path.join(OUTPUT_DIR, "test_results.txt")
 with open(out_test_file, "w") as writer:
     writer.write("index\tprediction\n")
     for ele in test_dataset.enumerate().as_numpy_iterator():
         writer.write(str(ele))
+    writer.write(predictions.to_list())
     logger.info(f"Wrote predictions to {out_test_file}")

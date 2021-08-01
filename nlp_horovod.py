@@ -60,10 +60,12 @@ def get_full_model(bert_model, regression=False):
     return full_model
 
 
-def get_train_dataset(rank):
+def get_train_dataset(rank, lim=None):
     train_dataset = tf.data.experimental.load(f"./dataset_shards/train_dataset_{rank}",
                                               element_spec=DATASET_TENSORSPEC,
                                               compression="GZIP")
+    if lim:
+        train_dataset = train_dataset.take(lim)
     return train_dataset
 
 
@@ -95,20 +97,26 @@ def add_samples_weights(dataset, keys_tensor, values_tensor, precision=None):
     return dataset
 
 
-def get_val_dataset(rank):
+def get_val_dataset(rank, lim=None):
     val_dataset = tf.data.experimental.load(f"./dataset_shards/val_dataset_{rank}",
                                             element_spec=DATASET_TENSORSPEC,
                                             compression="GZIP")
+    if lim:
+        val_dataset = val_dataset.take(lim)
     return val_dataset
 
 
-def get_test_dataset(num):
+def get_test_dataset(num, lim=None):
     test_dataset = tf.data.experimental.load("./dataset_shards/test_dataset_0", element_spec=DATASET_TENSORSPEC,
                                              compression="GZIP")
     for i in range(1, num):
         in_data = tf.data.experimental.load(f"./dataset_shards/test_dataset_{i}", element_spec=DATASET_TENSORSPEC,
                                             compression="GZIP")
         test_dataset = test_dataset.concatenate(in_data)
+
+    if lim:
+        test_dataset = test_dataset.take(lim)
+
     return test_dataset
 
 

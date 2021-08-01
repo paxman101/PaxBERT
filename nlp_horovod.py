@@ -15,6 +15,7 @@ DATASET_TENSORSPEC = ({'input_ids': TensorSpec(shape=(512,), dtype=tf.int32, nam
 BATCH_SIZE = 16
 N_EPOCHS = 3
 OUTPUT_DIR = "./output"
+IS_REGRESSION = True
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ class SavePretrainedCallback(tf.keras.callbacks.Callback):
         self.model.save_weights(self.output_dir.format(epoch=epoch))
 
 
-def get_full_model(bert_model):
+def get_full_model(bert_model, regression=False):
     bert_config = bert_model.config
 
     weight_initializer = tf.keras.initializers.GlorotNormal()
@@ -53,7 +54,8 @@ def get_full_model(bert_model):
     output = tf.keras.layers.Dense(bert_config.num_labels,
                                    kernel_initializer=weight_initializer,
                                    kernel_constraint=None,
-                                   bias_initializer='zeros')(output)
+                                   bias_initializer='zeros',
+                                   activation='linear' if regression else 'softmax')(output)
     full_model = tf.keras.Model([input_ids_layer, input_attention_layer], output)
     return full_model
 
@@ -65,7 +67,16 @@ def get_train_dataset(rank):
     return train_dataset
 
 
-def add_samples_weights(dataset, keys_tensor, values_tensor):
+# Function to map the labels from a regression suitable 0.0-1.0 to a classification suitable 0-4
+def process_into_classification(dataset):
+    def data_map(features, label):
+        return features, int(label * 4)
+
+    dataset = dataset.map(data_map, num_parallel_calls=tf.data.AUTOTUNE)
+    return dataset
+
+
+def add_samples_weights(dataset, keys_tensor, values_tensor, precision=None):
     table = tf.lookup.StaticHashTable(
         tf.lookup.KeyValueTensorInitializer(
             keys_tensor,
@@ -77,7 +88,7 @@ def add_samples_weights(dataset, keys_tensor, values_tensor):
     )
 
     def data_map(features, label):
-        weight = table.lookup(tf.strings.as_string(label, precision=2))
+        weight = table.lookup(tf.strings.as_string(label, precision=precision))
         return features, label, weight
 
     dataset = dataset.map(data_map, num_parallel_calls=tf.data.AUTOTUNE)
@@ -113,7 +124,10 @@ def main():
     # endregion
 
     # region Dataset loading and processing
-    keys_tensor = tf.constant(['0.00', '0.25', '0.50', '0.75', '1.00'])
+    if IS_REGRESSION:
+        keys_tensor = tf.constant(['0.00', '0.25', '0.50', '0.75', '1.00'])
+    else:
+        keys_tensor = tf.constant(['1', '2', '3', '4', '5'])
     values_tensor = tf.constant(
         [0.25516214033513884,
          0.3653295143642076,
@@ -121,12 +135,18 @@ def main():
          0.10369791403102925,
          0.03259607822927125])
     train_dataset = get_train_dataset(hvd.rank())
-    train_dataset = add_samples_weights(train_dataset, keys_tensor, values_tensor)
+    if not IS_REGRESSION:
+        train_dataset = process_into_classification(train_dataset)
+    train_dataset = add_samples_weights(train_dataset, keys_tensor, values_tensor, precision=2 if IS_REGRESSION else None)
 
     val_dataset = get_val_dataset(hvd.rank())
+    if not IS_REGRESSION:
+        val_dataset = process_into_classification(val_dataset)
 
     if hvd.rank() == 0:
         test_dataset = get_test_dataset(hvd.size())
+        if not IS_REGRESSION:
+            test_dataset = process_into_classification(test_dataset)
     # endregion
 
     # region Model compilation with optimizer and loss
@@ -139,12 +159,24 @@ def main():
                                               optimizer_type='adamw')
     optimizer = hvd.DistributedOptimizer(optimizer)
 
-    loss_fn = tf.keras.losses.MeanSquaredError()
-    metrics = []
+    if IS_REGRESSION:
+        config = ppb.DistilBertConfig(output_hidden_states=True, num_labels=1)
+        loss_fn = tf.keras.losses.MeanSquaredError()
+        metrics = []
+    else:
+        config = ppb.DistilBertConfig(output_hidden_states=True,
+                                      num_labels=5,
+                                      id2label={
+                                          0: 1, 1: 2, 2: 3, 3: 4, 4: 5
+                                      },
+                                      label2id={
+                                          1: 0, 2: 1, 3: 2, 5: 4
+                                      })
+        loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+        metrics = [tf.keras.metrics.SparseCategoricalAccuracy('accuracy')]
 
-    config = ppb.DistilBertConfig(output_hidden_states=True, num_labels=1)
     bert_model = ppb.TFDistilBertModel.from_pretrained("distilbert-base-uncased", config=config)
-    full_model = get_full_model(bert_model)
+    full_model = get_full_model(bert_model, regression=IS_REGRESSION)
 
     full_model.compile(optimizer=optimizer,
                        loss=loss_fn,
@@ -156,7 +188,7 @@ def main():
     callbacks = [hvd.callbacks.BroadcastGlobalVariablesCallback(0)]
 
     if hvd.rank() == 0:
-        callbacks.append(SavePretrainedCallback(output_dir="./checkpoints/checkpoint-test-{epoch}"))
+        callbacks.append(SavePretrainedCallback(output_dir="./checkpoints/checkpoint-test-regres-{epoch}"))
 
     num_val_samples = tf.data.experimental.cardinality(val_dataset).numpy()
 
@@ -174,8 +206,8 @@ def main():
         logger.info("Predictions on test dataset...")
         num_test_steps = tf.data.experimental.cardinality(test_dataset).numpy() // BATCH_SIZE
         predictions = full_model.predict(test_dataset.batch(BATCH_SIZE), steps=num_test_steps, verbose=1)
-        predicted_class = np.squeeze(predictions)
-        out_test_file = os.path.join(OUTPUT_DIR, "test_results2.txt")
+        predicted_class = np.squeeze(predictions) if IS_REGRESSION else np.argmax(predictions)
+        out_test_file = os.path.join(OUTPUT_DIR, "test_results_regres.txt")
         with open(out_test_file, "w") as writer:
             writer.write(str(predicted_class.tolist()))
             for ele in test_dataset.enumerate().as_numpy_iterator():

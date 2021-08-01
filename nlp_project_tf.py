@@ -86,7 +86,7 @@ train_dataset = tf.data.Dataset.from_tensor_slices((dict(train_encodings), list(
 val_dataset = tf.data.Dataset.from_tensor_slices((dict(val_encodings), list(val_labels)))
 test_dataset = tf.data.Dataset.from_tensor_slices((dict(test_encodings), list(test_labels)))
 
-keys_tensor = tf.constant(['0.00', '0.25', '0.50', '0.750', '1.00'])
+keys_tensor = tf.constant(['0.00', '0.25', '0.50', '0.75', '1.00'])
 values_tensor = tf.constant(
     [0.25516214033513884,
      0.3653295143642076,
@@ -120,7 +120,7 @@ metrics = ['RootMeanSquaredError']
 full_model.compile(optimizer=optimizer,
                    loss=loss_fn,
                    metrics=metrics)
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 N_EPOCHS = 3
 OUTPUT_DIR = "./output"
 

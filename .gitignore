@@ -1,3 +1,7 @@
-./output
-./dataset_shards
-./results
+/output
+/dataset_shards/*
+/results
+/lid.176.bin
+/out.csv
+/amazon_reviews_us_Books_v1_02.tsv
+/books_v1_02_cleaned.tsv.gz

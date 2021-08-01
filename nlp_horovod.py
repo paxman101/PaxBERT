@@ -135,7 +135,7 @@ def main():
     if IS_REGRESSION:
         keys_tensor = tf.constant(['0.00', '0.25', '0.50', '0.75', '1.00'])
     else:
-        keys_tensor = tf.constant(['1', '2', '3', '4', '5'])
+        keys_tensor = tf.constant(['0', '1', '2', '3', '4'])
     values_tensor = tf.constant(
         [0.25516214033513884,
          0.3653295143642076,
@@ -172,14 +172,7 @@ def main():
         loss_fn = tf.keras.losses.MeanSquaredError()
         metrics = []
     else:
-        config = ppb.DistilBertConfig(output_hidden_states=True,
-                                      num_labels=5,
-                                      id2label={
-                                          0: 1, 1: 2, 2: 3, 3: 4, 4: 5
-                                      },
-                                      label2id={
-                                          1: 0, 2: 1, 3: 2, 5: 4
-                                      })
+        config = ppb.DistilBertConfig(output_hidden_states=True, num_labels=5)
         loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
         metrics = [tf.keras.metrics.SparseCategoricalAccuracy('accuracy')]
 
@@ -214,7 +207,7 @@ def main():
         logger.info("Predictions on test dataset...")
         num_test_steps = tf.data.experimental.cardinality(test_dataset).numpy() // BATCH_SIZE
         predictions = full_model.predict(test_dataset.batch(BATCH_SIZE), steps=num_test_steps, verbose=1)
-        predicted_class = np.squeeze(predictions) if IS_REGRESSION else np.argmax(predictions)
+        predicted_class = np.squeeze(predictions) if IS_REGRESSION else np.argmax(predictions, axis=1)
         out_test_file = os.path.join(OUTPUT_DIR, "test_results_regres.txt")
         with open(out_test_file, "w") as writer:
             writer.write(str(predicted_class.tolist()))

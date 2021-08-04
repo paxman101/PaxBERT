@@ -63,6 +63,14 @@ def get_full_model(bert_model, regression=False):
     return full_model
 
 
+def get_model_config(config_class, regression=False):
+    if regression:
+        config = config_class(output_hidden_states=True, num_labels=1)
+    else:
+        config = config_class(output_hidden_states=True, num_labels=5)
+    return config
+
+
 def get_train_dataset(rank, lim=None):
     train_dataset = tf.data.experimental.load(f"./dataset_shards/train_dataset_{rank}",
                                               element_spec=DATASET_TENSORSPEC,
@@ -169,6 +177,8 @@ def main():
                                               num_warmup_steps=num_warmup_steps,
                                               optimizer_type='adamw')
     optimizer = hvd.DistributedOptimizer(optimizer)
+
+    config = get_model_config(ppb.DistilBertConfig, regression=IS_REGRESSION)
 
     if IS_REGRESSION:
         loss_fn = tf.keras.losses.MeanSquaredError()

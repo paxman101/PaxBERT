@@ -3,7 +3,7 @@ import tensorflow as tf
 import transformers as ppb
 from sklearn.model_selection import train_test_split
 
-df = pd.read_csv('books_v1_02_cleaned.tsv.gz', compression='gzip', sep='\t',nrows=400)
+df = pd.read_csv('books_v1_02_cleaned.tsv.gz', compression='gzip', sep='\t')
 #df = pd.read_csv('out.csv')
 
 df = df.astype({'star_rating': float})
@@ -12,8 +12,6 @@ df['star_rating'] = (df['star_rating'] - 1) / 4.
 train_texts, val_texts, train_labels, val_labels = train_test_split(df.review_body.values, df.star_rating.values,
                                                                     test_size=.2)
 test_texts, val_texts, test_labels, val_labels = train_test_split(val_texts, val_labels, test_size=.5)
-
-"""Initialize pretrained DistilBertForSequenceClassification model and tokenizer. Change config for 5 output classifications. """
 
 model_class, tokenizer_class, pretrained_weights = (
     ppb.TFBertForSequenceClassification, ppb.BertTokenizerFast,

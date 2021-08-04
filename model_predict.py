@@ -1,66 +1,50 @@
 import tensorflow as tf
-from tensorflow import TensorSpec
 import transformers as ppb
 import argparse
-import os
 import numpy as np
+from nlp_horovod import get_full_model, get_model_config, get_test_dataset
 
-DATASET_TENSORSPEC = ({'input_ids': TensorSpec(shape=(512,), dtype=tf.int32, name=None),
-                       'token_type_ids': TensorSpec(shape=(512,), dtype=tf.int32, name=None),
-                       'attention_mask': TensorSpec(shape=(512,), dtype=tf.int32, name=None)},
-                      TensorSpec(shape=(), dtype=tf.float64, name=None))
 
-OUTPUT_DIR = "./output"
+def model_predict_to_file(prediction_model,
+                          predict_dataset: tf.data.Dataset,
+                          output_file,
+                          batch_size=16,
+                          regression=False,
+                          verbosity=1):
+    num_test_steps = tf.data.experimental.cardinality(predict_dataset).numpy() // batch_size
+    predictions = prediction_model.predict(predict_dataset.batch(batch_size), steps=num_test_steps, verbose=verbosity)
+    predicted_class = np.squeeze(predictions) if regression else np.argmax(predictions, axis=1)
 
-parser = argparse.ArgumentParser(description="Run predictions with dataset with given saved model.")
-parser.add_argument("model_dir", type=str)
-parser.add_argument("-b", "--batch-size", dest="BATCH_SIZE", default=16)
+    with open(output_file, "w") as writer:
+        writer.write(str(predicted_class.tolist()))
+        for ele in predict_dataset.enumerate().as_numpy_iterator():
+            writer.write(str(ele))
 
-model_class, tokenizer_class, pretrained_weights = (
-    ppb.TFDistilBertModel, ppb.BertTokenizerFast, 'distilbert-base-uncased')  # for trainer API
 
-config = ppb.DistilBertConfig(output_hidden_states=True, num_labels=1)
-tokenizer = tokenizer_class.from_pretrained(pretrained_weights, config=config)
-model = model_class.from_pretrained(pretrained_weights, config=config)
+def main():
+    parser = argparse.ArgumentParser(description="Run predictions with dataset with given saved model.")
+    parser.add_argument("model_dir", type=str)
+    parser.add_argument("-o" "--output-file", dest="output_file")
+    parser.add_argument("-b", "--batch-size", dest="batch_size", default=16)
+    parser.add_argument("-r", "--is-regression", dest="is_regression", default=False)
+    parser.add_argument("-s", "--num-samples", dest="num_samples", default=None)
 
-weight_initializer = tf.keras.initializers.GlorotNormal()
-input_ids_layer = tf.keras.layers.Input(shape=(512,),
-                                        name='input_ids',
-                                        dtype='int32')
-input_attention_layer = tf.keras.layers.Input(shape=(512,),
-                                              name='attention_mask',
-                                              dtype='int32')
-last_hidden_state = model([input_ids_layer, input_attention_layer])[0]
+    args = parser.parse_args()
+    output_file = args.output_file
+    model_dir = args.model_dir
+    batch_size = args.batch_size
+    is_regression = args.is_regression
+    num_samples = args.num_samples
 
-cls_token = last_hidden_state[:, 0, :]
+    config = get_model_config(ppb.DistilBertConfig, regression=is_regression)
+    model = ppb.TFDistilBertForSequenceClassification.from_pretrained("distilbert-base-uncased",
+                                                                      config=config)
+    full_model = get_full_model(model, regression=is_regression)
+    full_model.load_weights(model_dir)
 
-leaky_relu = tf.keras.layers.LeakyReLU(alpha=0.01)
-output = tf.keras.layers.Dense(config.dim,
-                               kernel_initializer=weight_initializer,
-                               activation=leaky_relu)(cls_token)
-output = tf.keras.layers.Dropout(0.30)(output)
-output = tf.keras.layers.Dense(config.num_labels,
-                               kernel_initializer=weight_initializer,
-                               kernel_constraint=None,
-                               bias_initializer='zeros')(output)
-full_model = tf.keras.Model([input_ids_layer, input_attention_layer], output)
+    test_dataset = get_test_dataset(8, lim=num_samples)
+    model_predict_to_file(full_model, test_dataset, output_file, batch_size=batch_size, regression=is_regression)
 
-args = parser.parse_args()
 
-model_dir = args.model_dir
-BATCH_SIZE = args.BATCH_SIZE
-
-full_model.load_weights(model_dir)
-
-test_dataset = tf.data.experimental.load("./dataset_shards/test_dataset_0", element_spec=DATASET_TENSORSPEC, compression="GZIP")
-for i in range(1, 8):
-    in_data = tf.data.experimental.load(f"./dataset_shards/test_dataset_{i}", element_spec=DATASET_TENSORSPEC, compression="GZIP")
-    test_dataset = test_dataset.concatenate(in_data)
-
-predictions = full_model.predict(test_dataset.batch(batch_size=BATCH_SIZE), verbose=1)
-predicted_class = np.squeeze(predictions)
-out_test_file = os.path.join(OUTPUT_DIR, "test_results_train.txt")
-with open(out_test_file, "w") as writer:
-    writer.write(str(predicted_class.tolist()))
-    for ele in test_dataset.enumerate().as_numpy_iterator():
-        writer.write(str(ele))
+if __name__ == "__main__":
+    main()

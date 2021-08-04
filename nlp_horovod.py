@@ -2,10 +2,12 @@ import tensorflow as tf
 from tensorflow import TensorSpec
 import logging
 import os
-import horovod.tensorflow.keras as hvd
 import transformers as ppb
-import numpy as np
-from official.nlp import optimization
+from model_predict import model_predict_to_file
+
+if __name__ == "__main__":
+    from official.nlp import optimization
+    import horovod.tensorflow.keras as hvd
 
 DATASET_TENSORSPEC = ({'input_ids': TensorSpec(shape=(512,), dtype=tf.int32, name=None),
                        'token_type_ids': TensorSpec(shape=(512,), dtype=tf.int32, name=None),
@@ -15,6 +17,7 @@ DATASET_TENSORSPEC = ({'input_ids': TensorSpec(shape=(512,), dtype=tf.int32, nam
 BATCH_SIZE = 16
 N_EPOCHS = 3
 OUTPUT_DIR = "./output"
+PREDICT_FILE = "predict_results.txt"
 IS_REGRESSION = True
 
 logger = logging.getLogger(__name__)
@@ -168,11 +171,9 @@ def main():
     optimizer = hvd.DistributedOptimizer(optimizer)
 
     if IS_REGRESSION:
-        config = ppb.DistilBertConfig(output_hidden_states=True, num_labels=1)
         loss_fn = tf.keras.losses.MeanSquaredError()
         metrics = []
     else:
-        config = ppb.DistilBertConfig(output_hidden_states=True, num_labels=5)
         loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
         metrics = [tf.keras.metrics.SparseCategoricalAccuracy('accuracy')]
 
@@ -205,15 +206,14 @@ def main():
     # region Model inference
     if hvd.rank() == 0:
         logger.info("Predictions on test dataset...")
-        num_test_steps = tf.data.experimental.cardinality(test_dataset).numpy() // BATCH_SIZE
-        predictions = full_model.predict(test_dataset.batch(BATCH_SIZE), steps=num_test_steps, verbose=1)
-        predicted_class = np.squeeze(predictions) if IS_REGRESSION else np.argmax(predictions, axis=1)
-        out_test_file = os.path.join(OUTPUT_DIR, "test_results_regres.txt")
-        with open(out_test_file, "w") as writer:
-            writer.write(str(predicted_class.tolist()))
-            for ele in test_dataset.enumerate().as_numpy_iterator():
-                writer.write(str(ele))
-            logger.info(f"Wrote predictions to {out_test_file}")
+
+        predict_file_path = os.path.join(OUTPUT_DIR, PREDICT_FILE)
+        model_predict_to_file(full_model,
+                              test_dataset,
+                              predict_file_path,
+                              batch_size=BATCH_SIZE,
+                              regression=IS_REGRESSION,
+                              verbosity=1)
     # endregion
 
 
